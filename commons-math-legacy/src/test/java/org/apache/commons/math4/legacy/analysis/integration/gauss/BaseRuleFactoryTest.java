@@ -16,12 +16,16 @@
  */
 package org.apache.commons.math4.legacy.analysis.integration.gauss;
 
+import java.time.Duration;
 import java.util.List;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -29,6 +33,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import org.apache.commons.math4.legacy.core.Pair;
 import org.junit.Test;
 import org.junit.Assert;
+import org.junit.jupiter.api.Assertions;
 
 /**
  * Test for {@link BaseRuleFactory}.
@@ -64,6 +69,69 @@ public class BaseRuleFactoryTest {
         // Assertion would fail if "getRuleInternal" were not "synchronized".
         final int n = RuleBuilder.getNumberOfCalls();
         Assert.assertEquals("Rule computation was called " + n + " times", 1, n);
+    }
+
+    /**
+     * Tests that concurrent requests for rules of different orders on a shared
+     * factory complete. Unsynchronized updates of the cache can corrupt it, in
+     * which case a lookup spins indefinitely.
+     */
+    @Test
+    public void testConcurrentGetRuleDifferentOrders() {
+        // One thread per core, so that the threads run in parallel.
+        final int numThreads = Math.max(2, Math.min(8, Runtime.getRuntime().availableProcessors()));
+        final int numRules = 16 * numThreads;
+        // A thread spinning in a corrupted map does not respond to interruption,
+        // so it must not prevent the JVM from exiting.
+        final ExecutorService exec = Executors.newFixedThreadPool(numThreads, r -> {
+            final Thread thread = new Thread(r);
+            thread.setDaemon(true);
+            return thread;
+        });
+        try {
+            Assertions.assertTimeoutPreemptively(Duration.ofSeconds(10), () -> {
+                for (int round = 0; round < 1000; round++) {
+                    final BaseRuleFactory<Double> factory = new TrivialRuleFactory();
+                    // Compute the rules up front, so that the threads only race
+                    // on the cache of double-precision rules.
+                    for (int i = 1; i <= numRules; i++) {
+                        factory.getRuleInternal(i);
+                    }
+                    final AtomicInteger started = new AtomicInteger();
+                    final List<Future<?>> results = new ArrayList<>();
+                    for (int t = 0; t < numThreads; t++) {
+                        final int first = t + 1;
+                        results.add(exec.submit(() -> {
+                            // Wait for all threads, so that they are released together.
+                            started.incrementAndGet();
+                            while (started.get() < numThreads) {
+                                Thread.yield();
+                            }
+                            for (int i = first; i <= numRules; i += numThreads) {
+                                Assert.assertEquals(i, factory.getRule(i).getFirst().length);
+                            }
+                        }));
+                    }
+                    for (Future<?> f : results) {
+                        f.get();
+                    }
+                }
+            });
+        } finally {
+            exec.shutdownNow();
+        }
+    }
+
+    /** Factory with a cheap rule computation. */
+    private static final class TrivialRuleFactory extends BaseRuleFactory<Double> {
+        @Override
+        protected Pair<Double[], Double[]> computeRule(int numberOfPoints) {
+            final Double[] p = new Double[numberOfPoints];
+            final Double[] w = new Double[numberOfPoints];
+            Arrays.fill(p, 0.0);
+            Arrays.fill(w, 1.0);
+            return new Pair<>(p, w);
+        }
     }
 }
 
